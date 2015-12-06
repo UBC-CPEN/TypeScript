@@ -466,9 +466,6 @@ namespace ts {
                 return true;
             case SyntaxKind.VoidKeyword:
                 return node.parent.kind !== SyntaxKind.VoidExpression;
-            case SyntaxKind.StringLiteral:
-                // Specialized signatures can have string literals as their parameters' type names
-                return node.parent.kind === SyntaxKind.Parameter;
             case SyntaxKind.ExpressionWithTypeArguments:
                 return !isExpressionWithTypeArgumentsInClassExtendsClause(node);
 
@@ -907,23 +904,6 @@ namespace ts {
         }
 
         return false;
-    }
-
-    export function childIsDecorated(node: Node): boolean {
-        switch (node.kind) {
-            case SyntaxKind.ClassDeclaration:
-                return forEach((<ClassDeclaration>node).members, nodeOrChildIsDecorated);
-
-            case SyntaxKind.MethodDeclaration:
-            case SyntaxKind.SetAccessor:
-                return forEach((<FunctionLikeDeclaration>node).parameters, nodeIsDecorated);
-        }
-
-        return false;
-    }
-
-    export function nodeOrChildIsDecorated(node: Node): boolean {
-        return nodeIsDecorated(node) || childIsDecorated(node);
     }
 
     export function isPropertyAccessExpression(node: Node): node is PropertyAccessExpression {
@@ -1580,20 +1560,60 @@ namespace ts {
         return isFunctionLike(n) || n.kind === SyntaxKind.ModuleDeclaration || n.kind === SyntaxKind.SourceFile;
     }
 
-    export function cloneEntityName(node: EntityName): EntityName {
-        if (node.kind === SyntaxKind.Identifier) {
-            const clone = <Identifier>createSynthesizedNode(SyntaxKind.Identifier);
-            clone.text = (<Identifier>node).text;
-            return clone;
+    /**
+     * Creates a shallow, memberwise clone of a node. The "kind", "pos", "end", "flags", and "parent"
+     * properties are excluded by default, and can be provided via the "location", "flags", and
+     * "parent" parameters.
+     * @param node The node to clone.
+     * @param location An optional TextRange to use to supply the new position.
+     * @param flags The NodeFlags to use for the cloned node.
+     * @param parent The parent for the new node.
+     */
+    export function cloneNode<T extends Node>(node: T, location?: TextRange, flags?: NodeFlags, parent?: Node): T {
+        // We don't use "clone" from core.ts here, as we need to preserve the prototype chain of
+        // the original node. We also need to exclude specific properties and only include own-
+        // properties (to skip members already defined on the shared prototype).
+        const clone = location !== undefined
+            ? <T>createNode(node.kind, location.pos, location.end)
+            : <T>createSynthesizedNode(node.kind);
+
+        for (const key in node) {
+            if (clone.hasOwnProperty(key) || !node.hasOwnProperty(key)) {
+                continue;
+            }
+
+            (<any>clone)[key] = (<any>node)[key];
         }
-        else {
-            const clone = <QualifiedName>createSynthesizedNode(SyntaxKind.QualifiedName);
-            clone.left = cloneEntityName((<QualifiedName>node).left);
-            clone.left.parent = clone;
-            clone.right = <Identifier>cloneEntityName((<QualifiedName>node).right);
-            clone.right.parent = clone;
-            return clone;
+
+        if (flags !== undefined) {
+            clone.flags = flags;
         }
+
+        if (parent !== undefined) {
+            clone.parent = parent;
+        }
+
+        return clone;
+    }
+
+    /**
+     * Creates a deep clone of an EntityName, with new parent pointers.
+     * @param node The EntityName to clone.
+     * @param parent The parent for the cloned node.
+     */
+    export function cloneEntityName(node: EntityName, parent?: Node): EntityName {
+        const clone = cloneNode(node, node, node.flags, parent);
+        if (isQualifiedName(clone)) {
+            const { left, right } = clone;
+            clone.left = cloneEntityName(left, clone);
+            clone.right = cloneNode(right, right, right.flags, parent);
+        }
+
+        return clone;
+    }
+
+    export function isQualifiedName(node: Node): node is QualifiedName {
+        return node.kind === SyntaxKind.QualifiedName;
     }
 
     export function nodeIsSynthesized(node: Node): boolean {
@@ -1869,8 +1889,10 @@ namespace ts {
      * Resolves a local path to a path which is absolute to the base of the emit
      */
     export function getExternalModuleNameFromPath(host: EmitHost, fileName: string): string {
-        const dir = host.getCurrentDirectory();
-        const relativePath = getRelativePathToDirectoryOrUrl(dir, fileName, dir, f => host.getCanonicalFileName(f), /*isAbsolutePathAnUrl*/ false);
+        const getCanonicalFileName = (f: string) => host.getCanonicalFileName(f);
+        const dir = toPath(host.getCommonSourceDirectory(), host.getCurrentDirectory(), getCanonicalFileName);
+        const filePath = getNormalizedAbsolutePath(fileName, host.getCurrentDirectory());
+        const relativePath = getRelativePathToDirectoryOrUrl(dir, filePath, dir, getCanonicalFileName, /*isAbsolutePathAnUrl*/ false);
         return removeFileExtension(relativePath);
     }
 
@@ -1936,7 +1958,7 @@ namespace ts {
             const bundledSources = filter(host.getSourceFiles(),
                 sourceFile => !isDeclarationFile(sourceFile) && // Not a declaration file
                     (!isExternalModule(sourceFile) || // non module file
-                        (getEmitModuleKind(options) && isExternalModule(sourceFile)))); // module that can emit - note falsy value from getEmitModuleKind means the module kind that shouldn't be emitted 
+                        (getEmitModuleKind(options) && isExternalModule(sourceFile)))); // module that can emit - note falsy value from getEmitModuleKind means the module kind that shouldn't be emitted
             if (bundledSources.length) {
                 const jsFilePath = options.outFile || options.out;
                 const emitFileNames: EmitFileNames = {
@@ -2372,6 +2394,55 @@ namespace ts {
         }
 
         return output;
+    }
+
+    /**
+     * Serialize an object graph into a JSON string. This is intended only for use on an acyclic graph
+     * as the fallback implementation does not check for circular references by default.
+     */
+    export const stringify: (value: any) => string = typeof JSON !== "undefined" && JSON.stringify
+        ? JSON.stringify
+        : stringifyFallback;
+
+    /**
+     * Serialize an object graph into a JSON string.
+     */
+    function stringifyFallback(value: any): string {
+        // JSON.stringify returns `undefined` here, instead of the string "undefined".
+        return value === undefined ? undefined : stringifyValue(value);
+    }
+
+    function stringifyValue(value: any): string {
+        return typeof value === "string" ? `"${escapeString(value)}"`
+             : typeof value === "number" ? isFinite(value) ? String(value) : "null"
+             : typeof value === "boolean" ? value ? "true" : "false"
+             : typeof value === "object" && value ? isArray(value) ? cycleCheck(stringifyArray, value) : cycleCheck(stringifyObject, value)
+             : /*fallback*/ "null";
+    }
+
+    function cycleCheck(cb: (value: any) => string, value: any) {
+        Debug.assert(!value.hasOwnProperty("__cycle"), "Converting circular structure to JSON");
+        value.__cycle = true;
+        const result = cb(value);
+        delete value.__cycle;
+        return result;
+    }
+
+    function stringifyArray(value: any) {
+        return `[${reduceLeft(value, stringifyElement, "")}]`;
+    }
+
+    function stringifyElement(memo: string, value: any) {
+        return (memo ? memo + "," : memo) + stringifyValue(value);
+    }
+
+    function stringifyObject(value: any) {
+        return `{${reduceProperties(value, stringifyProperty, "")}}`;
+    }
+
+    function stringifyProperty(memo: string, value: any, key: string) {
+        return value === undefined || typeof value === "function" || key === "__cycle" ? memo
+             : (memo ? memo + "," : memo) + `"${escapeString(key)}":${stringifyValue(value)}`;
     }
 
     const base64Digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
