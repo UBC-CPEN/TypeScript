@@ -1,0 +1,31 @@
+We want to implement an improved error message for interface declarations.
+We also want to implement an improved error message for object type literals.
+
+Here is the link to all of the pull request changes that we made:
+https://github.com/Microsoft/TypeScript/pull/5736/files
+
+Implementations for both interface declarations and object type literals are listed below:
+TypeScript/src/compiler/checker.ts:
+function checkGrammarProperty
+- we report the proper error messages located in diagnosticMessages.json here
+
+TypeScript/src/compiler/parser.ts:
+function parsePropertyOrMethodSignature
+- we parse an initializer in order to trigger an error later on in the checker
+
+TypeScript/src/compiler/diagnosticMessages.json:
+added errors with "code" : 1246 and "code" : 1247
+
+TypeScript/src/compiler/types.ts:
+interface PropertySignature
+- added optional initializer; if an initializer is present the checker will report an error
+
+Test cases:
+TypeScript/tests/cases/compiler/errorOnInitializerInInterfaceProperty.ts
+TypeScript/tests/cases/compiler/errorOnInitializerInObjectTypeLiteralProperty.ts
+
+Updated baselines:
+TypeScript/tests/baselines/reference/errorOnInitializerInInterfaceProperty.errors.txt
+TypeScript/tests/baselines/reference/errorOnInitializerInInterfaceProperty.js
+TypeScript/tests/baselines/reference/errorOnInitializerInObjectTypeLiteralProperty.errors.txt
+TypeScript/tests/baselines/reference/errorOnInitializerInObjectTypeLiteralProperty.js
